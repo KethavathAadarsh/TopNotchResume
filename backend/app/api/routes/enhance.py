@@ -5,27 +5,26 @@ GET  /api/enhance/{session_id}           → current session state (instant)
 POST /api/enhance/{session_id}/analyze   → trigger 4-agent parallel analysis (async background)
 POST /api/enhance/{session_id}/generate  → apply accepted improvements → new versioned DOCX
 """
-import asyncio
 import logging
-import uuid
-from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from app.config import settings
+from app.services.generation import store_docx
+from app.utils.guards import limit_ai, limit_pipeline
+from app.utils.tasks import spawn
 from app.utils.session_store import (
     get_session, update_session, add_version, set_agent_progress,
 )
 from app.agents.rsea_agent import run_full_analysis, enhance_composition
 from app.engine.ats_engine import compute_ats_score
-from app.engine.docx_engine import render_resume
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-DOWNLOADS_DIR = Path(settings.downloads_dir)
-DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+# Sessions with an enhancement pass in flight — a double-click would otherwise
+# run two LLM passes and race on the version number.
+_generating: set[str] = set()
 
 
 # ── Background analysis task ─────────────────────────────────────────────────
@@ -84,7 +83,7 @@ async def get_enhance_session(session_id: str):
     }
 
 
-@router.post("/enhance/{session_id}/analyze")
+@router.post("/enhance/{session_id}/analyze", dependencies=[Depends(limit_ai)])
 async def trigger_analysis(session_id: str):
     """
     Start the 4-agent RSEA analysis as a background task.
@@ -112,7 +111,7 @@ async def trigger_analysis(session_id: str):
             "career_intel":   "pending",
         },
     })
-    asyncio.create_task(_run_analysis_background(session_id))
+    spawn(_run_analysis_background(session_id), name=f"rsea-{session_id[:8]}")
     return {"status": "analyzing", "message": "Analysis started"}
 
 
@@ -120,7 +119,7 @@ class GenerateEnhancedRequest(BaseModel):
     accepted_improvement_ids: list[str]
 
 
-@router.post("/enhance/{session_id}/generate")
+@router.post("/enhance/{session_id}/generate", dependencies=[Depends(limit_pipeline)])
 async def generate_enhanced_resume(session_id: str, req: GenerateEnhancedRequest):
     """
     Apply accepted resume improvements via LLM, save new versioned DOCX.
@@ -141,6 +140,16 @@ async def generate_enhanced_resume(session_id: str, req: GenerateEnhancedRequest
     if not accepted:
         raise HTTPException(status_code=400, detail="No improvements selected")
 
+    if session_id in _generating:
+        raise HTTPException(status_code=409, detail="An enhancement is already running for this session")
+    _generating.add(session_id)
+    try:
+        return await _generate_enhanced(session_id, session, accepted)
+    finally:
+        _generating.discard(session_id)
+
+
+async def _generate_enhanced(session_id: str, session: dict, accepted: list[dict]) -> dict:
     # LLM enhancement pass
     try:
         new_composition = await enhance_composition(
@@ -153,20 +162,11 @@ async def generate_enhanced_resume(session_id: str, req: GenerateEnhancedRequest
         logger.error("Enhancement failed for session %s: %s", session_id, exc)
         raise HTTPException(status_code=500, detail=f"Enhancement failed: {exc}")
 
-    # Re-score and render
+    # Re-score and render a versioned DOCX
     ats_result = compute_ats_score(new_composition, session["jd_analysis"])
-    docx_bytes = render_resume(new_composition, resume_format=session["resume_format"])
-
-    # Save versioned DOCX
-    download_id = str(uuid.uuid4())
-    candidate_name = (
-        new_composition.get("personal", {}).get("name", "resume").replace(" ", "_")
-    )
     next_version = len(session["versions"]) + 1
-    filename = f"{candidate_name}_v{next_version}_{download_id[:8]}.docx"
-    (DOWNLOADS_DIR / filename).write_bytes(docx_bytes)
-    (DOWNLOADS_DIR / f"{download_id}.meta").write_text(
-        f"{filename}|||{session['resume_format']}"
+    download_id, filename = await store_docx(
+        new_composition, session["resume_format"], label=f"v{next_version}"
     )
 
     # Update session — add_version resets analysis_status to "pending"

@@ -2,6 +2,7 @@
 Phase 3 — SSE Streaming Route
 POST /api/generate/async   → starts a background pipeline job, returns {job_id}
 GET  /api/generate/stream/{job_id} → Server-Sent Events: real-time pipeline steps
+GET  /api/generate/result/{job_id} → poll fallback for the final result
 """
 import asyncio
 import json
@@ -9,29 +10,23 @@ import logging
 import time
 import uuid
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.models.schema import GenerateRequest
 from app.agents.orchestrator import run_jarvis, create_job, finish_job, get_job
-from app.engine.docx_engine import render_resume
-from app.engine.ats_engine import compute_ats_score
-from app.utils.session_store import create_session
-from app.utils.pg_store import save_generation as pg_save_generation
+from app.services.generation import finalize_generation
+from app.utils.guards import client_id, generation_slots, limit_pipeline
+from app.utils.tasks import spawn
 from app.config import settings
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-DOWNLOADS_DIR = Path(settings.downloads_dir)
-DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
-
 # ── Step labels pushed to the client ────────────────────────────────────────
 
 _STEP_LABELS = {
-    "profile_agent":    {"label": "Profile Agent",    "desc": "Analyzing candidate profile — seniority, domains, achievements"},
-    "jd_agent":         {"label": "JD Analyzer",      "desc": "Extracting ATS keywords, requirements, hiring signals"},
+    "queued":           {"label": "Queued",            "desc": "Waiting for a free generation slot"},
     "parallel_init":    {"label": "Intelligence Init", "desc": "Profile + JD agents running in parallel"},
     "relevance":        {"label": "Relevance Engine",  "desc": "Computing semantic alignment score, ranking experiences"},
     "optimize":         {"label": "Content Optimizer", "desc": "Rewriting bullets for high impact and ATS optimization"},
@@ -41,7 +36,7 @@ _STEP_LABELS = {
 }
 
 
-async def _run_pipeline(job_id: str, request: GenerateRequest):
+async def _run_pipeline(job_id: str, request: GenerateRequest, owner: str | None = None):
     """Background coroutine — runs JARVIS and emits SSE events."""
     job = get_job(job_id)
     if not job:
@@ -49,135 +44,39 @@ async def _run_pipeline(job_id: str, request: GenerateRequest):
 
     def emit(step: str, status: str, **extra):
         meta = _STEP_LABELS.get(step, {"label": step.replace("_", " ").title(), "desc": ""})
-        event = {"step": step, "status": status, "label": meta["label"], "desc": meta["desc"], **extra}
-        job["events"].append(event)
+        job["events"].append({"step": step, "status": status, "label": meta["label"], "desc": meta["desc"], **extra})
 
+    slots = generation_slots()
     try:
-        emit("parallel_init", "running")
-        start_ms = int(time.time() * 1000)
-
-        # Run JARVIS pipeline
-        state = await run_jarvis(request, job_id=job_id)
-
-        emit("parallel_init", "done")
-        emit("relevance", "done")
-        emit("optimize", "done")
-        emit("compose", "done")
-
-        composition = state.get("composition")
-        if not composition:
-            raise ValueError("Composer agent did not produce a composition. Check ANTHROPIC_API_KEY.")
-
-        emit("render", "running")
-        jd_analysis = state.get("jd_analysis", {})
-        ats_result = compute_ats_score(composition, jd_analysis)
-        docx_bytes = render_resume(composition, resume_format=request.format.value)
-        emit("render", "done")
-
-        # Store file
-        download_id = str(uuid.uuid4())
-        candidate_name = composition.get("personal", {}).get("name", "resume").replace(" ", "_")
-        filename = f"{candidate_name}_{download_id[:8]}.docx"
-        file_path = DOWNLOADS_DIR / filename
-        with open(file_path, "wb") as f:
-            f.write(docx_bytes)
-        meta_path = DOWNLOADS_DIR / f"{download_id}.meta"
-        meta_path.write_text(f"{filename}|||{request.format.value}")
-
-        elapsed_ms = int(time.time() * 1000) - start_ms
-
-        # Create RSEA session so user can enhance from the download screen
-        session_id = create_session(
-            composition=composition,
-            jd_analysis=jd_analysis,
-            resume_format=request.format.value,
-            v1_download_id=download_id,
-            v1_filename=filename,
-            v1_ats_score=ats_result["score"],
-            missing_keywords=ats_result["missing_keywords"],
-        )
-
-        result = {
-            "download_id": download_id,
-            "session_id": session_id,
-            "ats_score": ats_result["score"],
-            "keywords_matched": ats_result["matched_keywords"],
-            "keywords_missing": ats_result["missing_keywords"],
-            "sections_included": composition.get("section_order", []),
-            "generation_time_ms": elapsed_ms,
-        }
-
-        # Persist full profile to PostgreSQL DV2
-        try:
-            profile = request.profile
-            await pg_save_generation(
-                email=profile.email,
-                name=profile.name,
-                phone=profile.phone or "",
-                location=profile.location or "",
-                linkedin=profile.linkedin or "",
-                github=profile.github or "",
-                website=profile.website or "",
-                summary=profile.summary or "",
-                experience=[e.model_dump() for e in profile.experience],
-                skill_categories=[c.model_dump() for c in profile.skill_categories],
-                flat_skills=list(profile.flat_skills),
-                projects=[p.model_dump() for p in profile.projects],
-                education=[e.model_dump() for e in profile.education],
-                certifications=[c.model_dump() for c in profile.certifications],
-                job_description=request.job_description,
-                company_name=jd_analysis.get("company_name", ""),
-                role_title=jd_analysis.get("role_title", ""),
-                target_role=request.target_role or jd_analysis.get("role_title", ""),
-                format=request.format.value,
-                max_pages=request.max_pages,
-                download_id=download_id,
-                session_id=session_id,
-                filename=filename,
-                ats_score=ats_result["score"],
-                composition=composition,
-                jd_analysis=jd_analysis,
-                generation_ms=elapsed_ms,
-                kw_matched=len(ats_result["matched_keywords"]),
-            )
-        except Exception as pg_err:
-            logger.warning("PostgreSQL save failed: %s", pg_err)
-
-        # Also persist to SQLite history DB
-        try:
-            from app.utils.db import save_resume_history
-            await save_resume_history(
-                download_id=download_id,
-                candidate_name=composition.get("personal", {}).get("name", ""),
-                target_role=state.get("jd_analysis", {}).get("role_title", ""),
-                company=state.get("jd_analysis", {}).get("company_name", ""),
-                resume_format=request.format.value,
-                ats_score=ats_result["score"],
-                keywords_matched=len(ats_result["matched_keywords"]),
-                generation_time_ms=elapsed_ms,
-                filename=filename,
-                session_id=session_id,
-            )
-        except Exception as db_err:
-            logger.warning("History save failed: %s", db_err)
-
-        logger.info("Async pipeline done | job=%s | ATS=%.1f | id=%s", job_id, ats_result["score"], download_id)
+        if slots.locked():
+            emit("queued", "running")
+        async with slots:
+            job["status"] = "running"
+            started_at = time.monotonic()
+            state = await run_jarvis(request, on_progress=emit)
+            result = await finalize_generation(request, state, started_at=started_at, client_id=owner)
+            emit("render", "done")
+        logger.info("Async pipeline done | job=%s | ATS=%.1f", job_id, result["ats_score"])
         finish_job(job_id, result=result)
 
     except Exception as exc:
-        logger.error("Async pipeline error | job=%s: %s", job_id, exc)
-        finish_job(job_id, error=str(exc))
+        logger.exception("Async pipeline error | job=%s", job_id)
+        finish_job(job_id, error=str(exc) or exc.__class__.__name__)
+
+
+def start_pipeline_job(request: GenerateRequest, owner: str | None) -> str:
+    job_id = str(uuid.uuid4())
+    create_job(job_id)
+    spawn(_run_pipeline(job_id, request, owner), name=f"pipeline-{job_id[:8]}")
+    return job_id
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
-@router.post("/generate/async")
-async def start_generation(request: GenerateRequest):
+@router.post("/generate/async", dependencies=[Depends(limit_pipeline)])
+async def start_generation(request: GenerateRequest, owner: str | None = Depends(client_id)):
     """Kick off an async generation job. Returns job_id for SSE polling."""
-    job_id = str(uuid.uuid4())
-    create_job(job_id)
-    asyncio.create_task(_run_pipeline(job_id, request))
-    return {"job_id": job_id}
+    return {"job_id": start_pipeline_job(request, owner)}
 
 
 @router.get("/generate/result/{job_id}")

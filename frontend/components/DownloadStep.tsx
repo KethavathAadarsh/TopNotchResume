@@ -219,7 +219,7 @@ export function DownloadStep({ result, onRestart, selectedModel }: Props) {
       </div>
 
       <p className="text-xs text-center text-slate-700">
-        Download link expires in 1 hour. Open in Word, Google Docs, or any .docx viewer.
+        Download link expires in 24 hours. Open in Word, Google Docs, or any .docx viewer.
       </p>
     </div>
   );

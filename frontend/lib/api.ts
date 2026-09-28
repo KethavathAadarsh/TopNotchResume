@@ -1,6 +1,40 @@
 import type { GenerateRequest, GenerateResponse } from "@/types/resume";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+export const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+// Anonymous per-browser ID. Not authentication — it scopes history so each
+// visitor sees only their own generations on the shared public backend.
+const CLIENT_ID_KEY = "tnr_client_id";
+
+function newId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+
+export function getClientId(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    let id = window.localStorage.getItem(CLIENT_ID_KEY);
+    if (!id) {
+      id = newId();
+      window.localStorage.setItem(CLIENT_ID_KEY, id);
+    }
+    return id;
+  } catch {
+    return ""; // storage blocked (private mode) — history just stays empty
+  }
+}
+
+/** fetch against the API with the client ID header attached. */
+export function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  const clientId = getClientId();
+  if (clientId) headers.set("X-Client-Id", clientId);
+  return fetch(`${API_URL}${path}`, { ...init, headers });
+}
 
 function _throwDetail(err: { detail?: unknown }, fallback: string): never {
   const detail = err.detail;
@@ -20,7 +54,7 @@ function _throwDetail(err: { detail?: unknown }, fallback: string): never {
 
 /** Synchronous fallback — returns full result when done. */
 export async function generateResume(request: GenerateRequest): Promise<GenerateResponse> {
-  const res = await fetch(`${API_URL}/api/generate`, {
+  const res = await apiFetch(`/api/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(request),
@@ -32,7 +66,7 @@ export async function generateResume(request: GenerateRequest): Promise<Generate
 
 /** Phase 3: Kick off async job, returns job_id for SSE streaming. */
 export async function startGenerationAsync(request: GenerateRequest): Promise<{ job_id: string }> {
-  const res = await fetch(`${API_URL}/api/generate/async`, {
+  const res = await apiFetch(`/api/generate/async`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(request),
@@ -56,7 +90,7 @@ export async function uploadResume(
 ): Promise<{ filename: string; text: string; char_count: number }> {
   const form = new FormData();
   form.append("file", file);
-  const res = await fetch(`${API_URL}/api/upload/resume`, {
+  const res = await apiFetch(`/api/upload/resume`, {
     method: "POST",
     body: form,
     signal: AbortSignal.timeout(60_000),
@@ -75,7 +109,7 @@ export async function extractSection(
   section: SectionType,
   rawText: string
 ): Promise<{ section: SectionType; data: Record<string, unknown> }> {
-  const res = await fetch(`${API_URL}/api/extract`, {
+  const res = await apiFetch(`/api/extract`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ section, raw_text: rawText }),
@@ -102,13 +136,13 @@ export interface HistoryItem {
 }
 
 export async function fetchHistory(limit = 50): Promise<{ items: HistoryItem[]; count: number }> {
-  const res = await fetch(`${API_URL}/api/history?limit=${limit}`);
+  const res = await apiFetch(`/api/history?limit=${limit}`);
   if (!res.ok) throw new Error(`History fetch failed (HTTP ${res.status})`);
   return res.json();
 }
 
 export async function deleteHistoryItem(downloadId: string): Promise<void> {
-  await fetch(`${API_URL}/api/history/${downloadId}`, { method: "DELETE" });
+  await apiFetch(`/api/history/${downloadId}`, { method: "DELETE" });
 }
 
 export interface RestoreData {
@@ -122,7 +156,7 @@ export interface RestoreData {
 }
 
 export async function fetchRestoreProfile(downloadId: string): Promise<RestoreData> {
-  const res = await fetch(`${API_URL}/api/history/${downloadId}/restore`);
+  const res = await apiFetch(`/api/history/${downloadId}/restore`);
   if (!res.ok) _throwDetail(await res.json().catch(() => ({})), `Restore failed (HTTP ${res.status})`);
   return res.json();
 }
@@ -145,7 +179,7 @@ export interface CoverLetterResponse {
 export async function generateCoverLetter(
   req: CoverLetterRequest
 ): Promise<CoverLetterResponse> {
-  const res = await fetch(`${API_URL}/api/cover-letter`, {
+  const res = await apiFetch(`/api/cover-letter`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),
@@ -298,13 +332,13 @@ export interface RseaGenerateResponse {
 }
 
 export async function fetchEnhanceSession(sessionId: string): Promise<RseaSession> {
-  const res = await fetch(`${API_URL}/api/enhance/${sessionId}`);
+  const res = await apiFetch(`/api/enhance/${sessionId}`);
   if (!res.ok) _throwDetail(await res.json().catch(() => ({})), `Session fetch failed (HTTP ${res.status})`);
   return res.json();
 }
 
 export async function triggerAnalysis(sessionId: string): Promise<{ status: string }> {
-  const res = await fetch(`${API_URL}/api/enhance/${sessionId}/analyze`, {
+  const res = await apiFetch(`/api/enhance/${sessionId}/analyze`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
   });
@@ -316,7 +350,7 @@ export async function generateEnhanced(
   sessionId: string,
   acceptedImprovementIds: string[],
 ): Promise<RseaGenerateResponse> {
-  const res = await fetch(`${API_URL}/api/enhance/${sessionId}/generate`, {
+  const res = await apiFetch(`/api/enhance/${sessionId}/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ accepted_improvement_ids: acceptedImprovementIds }),
@@ -349,7 +383,7 @@ export async function runQualityCheck(req: {
   user_feedback?: string;
   iteration?: number;
 }): Promise<QualityReport> {
-  const res = await fetch(`${API_URL}/api/quality-check`, {
+  const res = await apiFetch(`/api/quality-check`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),
@@ -365,7 +399,7 @@ export async function startRefine(req: {
   iteration: number;
   model?: string;
 }): Promise<RefineResponse> {
-  const res = await fetch(`${API_URL}/api/refine`, {
+  const res = await apiFetch(`/api/refine`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),

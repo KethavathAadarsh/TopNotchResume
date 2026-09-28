@@ -7,6 +7,7 @@ Session lifecycle:
   mark agents done  → career_report populated, analysis_status: "ready"
   generate enhanced → new version added, analysis_status reset to "pending" for re-analysis
 """
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -52,8 +53,18 @@ def create_session(
             }
         ],
         "created_at": _now(),
+        "_created_mono": time.monotonic(),
     }
     return session_id
+
+
+def prune_sessions(max_age_seconds: float) -> int:
+    """Drop sessions older than max_age so the in-memory store stays bounded."""
+    now = time.monotonic()
+    stale = [sid for sid, s in _sessions.items() if now - s.get("_created_mono", now) > max_age_seconds]
+    for sid in stale:
+        del _sessions[sid]
+    return len(stale)
 
 
 def get_session(session_id: str) -> Optional[dict]:

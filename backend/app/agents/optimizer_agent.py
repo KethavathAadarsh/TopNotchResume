@@ -4,6 +4,7 @@ Transforms raw bullets into high-impact, ATS-optimized, recruiter-friendly conte
 """
 import json
 import logging
+from app.agents.matching import RoleIndex
 from app.agents.state import AgentState
 from app.utils.claude_client import call_claude_structured
 
@@ -91,22 +92,22 @@ async def run_optimizer_agent(state: AgentState) -> dict:
     relevance = state.get("relevance_map", {})
 
     # Only filter experience by relevance; always optimize ALL projects
-    # (projects filtered out here would have no optimized bullets in the composer)
-    included_companies = {
-        e["company"] for e in relevance.get("experience_relevance", [])
-        if e.get("include", True)
-    }
+    # (projects filtered out here would have no optimized bullets in the composer).
+    # Roles are matched on title+company so one excluded role doesn't drop, or
+    # one included role doesn't keep, every other role at the same employer.
+    relevance_roles = RoleIndex(relevance.get("experience_relevance"))
 
     relevant_experience = [
         e.model_dump() for e in profile.experience
-        if not included_companies or e.company in included_companies
+        if (relevance_roles.find(e.title, e.company) or {}).get("include", True) is not False
     ]
     # Always optimize every project the user provided
     relevant_projects = [p.model_dump() for p in profile.projects]
 
     injection_map = {
-        e["company"]: e.get("injection_opportunities", [])
+        f"{e.get('title', '')} @ {e.get('company', '')}": e.get("injection_opportunities", [])
         for e in relevance.get("experience_relevance", [])
+        if isinstance(e, dict)
     }
 
     user_message = f"""Rewrite and optimize these resume bullets for the target role.
@@ -123,7 +124,7 @@ SUMMARY ANGLE: {relevance.get('recommended_summary_angle', 'Emphasize technical 
 EXPERIENCE TO OPTIMIZE:
 {json.dumps(relevant_experience, indent=2)}
 
-INJECTION OPPORTUNITIES BY COMPANY:
+INJECTION OPPORTUNITIES BY ROLE (title @ company):
 {json.dumps(injection_map, indent=2)}
 
 PROJECTS TO OPTIMIZE:

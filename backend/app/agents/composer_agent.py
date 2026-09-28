@@ -5,6 +5,7 @@ ResumeComposition JSON that the DOCX engine renders directly.
 """
 import json
 import logging
+from app.agents.matching import RoleIndex
 from app.agents.state import AgentState
 from app.utils.claude_client import call_claude_structured
 
@@ -166,32 +167,36 @@ async def run_composer_agent(state: AgentState) -> dict:
     is_refinement = bool(quality_feedback)
 
     # ── Pre-merge: inject optimized bullets into original experience ──────────
-    # Build lookup: company → optimized bullets (from Optimizer Agent)
-    opt_exp_map: dict[str, list[str]] = {
-        e["company"]: e.get("optimized_bullets", [])
-        for e in optimized.get("optimized_experience", [])
-    }
-    # Also try title-based lookup as fallback (handles company-name mismatches)
-    opt_exp_map_by_title: dict[str, list[str]] = {
-        e["title"]: e.get("optimized_bullets", [])
-        for e in optimized.get("optimized_experience", [])
-    }
+    # Matched on title+company — several roles at one employer must each keep
+    # their own optimized bullets.
+    optimized_roles = RoleIndex(optimized.get("optimized_experience"))
+
+    def _optimized_bullets(exp: dict) -> list[str]:
+        match = optimized_roles.find(exp.get("title"), exp.get("company"))
+        bullets = (match or {}).get("optimized_bullets") or []
+        return [b for b in bullets if isinstance(b, str)]
 
     # Build lookup: project name → optimized project data
     opt_proj_map: dict[str, dict] = {
         p["name"]: p
         for p in optimized.get("optimized_projects", [])
+        if isinstance(p, dict) and p.get("name")
     }
 
     # Relevance ordering/filtering for experience
-    experience_relevance = {
-        e["company"]: e
-        for e in relevance.get("experience_relevance", [])
-    }
+    relevance_roles = RoleIndex(relevance.get("experience_relevance"))
+
+    def _relevance(exp: dict) -> dict:
+        return relevance_roles.find(exp.get("title"), exp.get("company")) or {}
+
+    def _rank(exp: dict) -> int:
+        rank = _relevance(exp).get("priority_rank", 99)
+        return rank if isinstance(rank, int) else 99
+
     ordered_experience = sorted(
-        [e.model_dump() for e in profile.experience if
-         not experience_relevance or experience_relevance.get(e.company, {}).get("include", True)],
-        key=lambda e: experience_relevance.get(e["company"], {}).get("priority_rank", 99)
+        [d for d in (e.model_dump() for e in profile.experience)
+         if _relevance(d).get("include", True) is not False],
+        key=_rank,
     )
 
     # Build a compound-key lookup (title|company) for original profile bullets.
@@ -222,8 +227,7 @@ async def run_composer_agent(state: AgentState) -> dict:
         # This preserves optimized language while ensuring nothing the user wrote is dropped
         # (e.g. "margin analyst agent", "bank reconciliation").
         for exp in ordered_experience:
-            opt_b = (opt_exp_map.get(exp["company"], [])
-                     or opt_exp_map_by_title.get(exp["title"], []))
+            opt_b = _optimized_bullets(exp)
             orig_b = _orig_bullets(exp)
 
             if opt_b and orig_b:
@@ -241,7 +245,7 @@ async def run_composer_agent(state: AgentState) -> dict:
     else:
         # Normal mode: inject optimized bullets — prefer company match, fall back to title match
         for exp in ordered_experience:
-            ob = opt_exp_map.get(exp["company"], []) or opt_exp_map_by_title.get(exp["title"], [])
+            ob = _optimized_bullets(exp)
             if ob:
                 exp["bullets"] = ob
             # Remove empty bullets from raw form input

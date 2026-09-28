@@ -79,7 +79,7 @@ export default function LandingPage() {
             Generate My Resume →
           </Link>
           <a
-            href="https://github.com"
+            href="https://github.com/KethavathAadarsh/TopNotchResume"
             className="btn-secondary text-base px-8 py-3"
             target="_blank"
             rel="noopener noreferrer"
@@ -143,7 +143,7 @@ export default function LandingPage() {
         <div className="flex items-center justify-center gap-4">
           <Link href="/generate" className="hover:text-slate-400 transition-colors">Build Resume</Link>
           <Link href="/history" className="hover:text-slate-400 transition-colors">History</Link>
-          <a href="/docs/architecture.html" className="hover:text-slate-400 transition-colors">Architecture</a>
+          <a href={`${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/docs/architecture.html`} className="hover:text-slate-400 transition-colors">Architecture</a>
         </div>
       </footer>
     </div>

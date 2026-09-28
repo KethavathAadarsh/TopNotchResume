@@ -2,6 +2,7 @@
 TopNotchResume — FastAPI Application Entry Point
 Phase 2-4: Added SSE streaming, resume history, cover letter generation.
 """
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -28,10 +29,35 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+_SWEEP_INTERVAL_SECONDS = 600
+
+
+async def _housekeeping():
+    """Periodically bound everything that otherwise grows for the process lifetime."""
+    from app.agents.orchestrator import prune_jobs
+    from app.services.generation import sweep_expired_downloads
+    from app.utils.guards import prune_limiters
+    from app.utils.session_store import prune_sessions
+
+    while True:
+        await asyncio.sleep(_SWEEP_INTERVAL_SECONDS)
+        try:
+            files = await asyncio.to_thread(sweep_expired_downloads)
+            jobs = prune_jobs(settings.job_ttl_seconds)
+            sessions = prune_sessions(settings.session_ttl_seconds)
+            prune_limiters()
+            if files or jobs or sessions:
+                logger.info("Housekeeping: removed %d files, %d jobs, %d sessions", files, jobs, sessions)
+        except Exception:
+            logger.exception("Housekeeping pass failed")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     logger.info("TopNotchResume API v2 starting up — Phase 2-4 active")
     os.makedirs(settings.downloads_dir, exist_ok=True)
+    if not settings.anthropic_api_key:
+        logger.warning("ANTHROPIC_API_KEY is not set — every generation will fail")
 
     # Initialise SQLite history DB
     try:
@@ -47,8 +73,14 @@ async def lifespan(_app: FastAPI):
     except Exception as exc:
         logger.warning("PostgreSQL init failed (non-fatal): %s", exc)
 
+    from app.utils.tasks import cancel_all, spawn
+    spawn(_housekeeping(), name="housekeeping")
+
     yield
     logger.info("TopNotchResume API shutting down")
+    await cancel_all()
+    from app.utils.pg_store import close_pg
+    await close_pg()
 
 
 app = FastAPI(
@@ -61,9 +93,12 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # No cookies or auth headers are used — keeping credentials off means a
+    # misconfigured origin list can't expose anything credentialed.
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type", "X-Client-Id"],
+    expose_headers=["Retry-After"],
 )
 
 # Core routes

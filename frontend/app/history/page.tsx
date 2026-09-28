@@ -163,7 +163,7 @@ export default function HistoryPage() {
 
         {items.length > 0 && (
           <p className="text-center text-xs text-slate-700 mt-8">
-            {items.length} resume{items.length !== 1 ? "s" : ""} · Downloads expire 1 hour after generation
+            {items.length} resume{items.length !== 1 ? "s" : ""} · Downloads expire 24 hours after generation
           </p>
         )}
       </main>

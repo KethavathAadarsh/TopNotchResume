@@ -11,6 +11,8 @@ const nextConfig = {
   images: { unoptimized: isPages },
   env: {
     NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000",
+    // Plain <a> links don't get basePath applied automatically
+    NEXT_PUBLIC_BASE_PATH: basePath,
   },
 };
 

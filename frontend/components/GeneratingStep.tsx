@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useRef, useState, useCallback } from "react";
+import { API_URL } from "@/lib/api";
 
 const STEPS = [
   { key: "parallel_init", label: "Intelligence Init",  desc: "Profile + JD agents running in parallel" },
@@ -32,6 +33,7 @@ export function GeneratingStep({ jobId, error, onComplete, onError }: Props) {
   const [elapsed, setElapsed] = useState(0);
   const [liveError, setLiveError] = useState("");
   const [recovering, setRecovering] = useState(false);
+  const [queued, setQueued] = useState(false);
   const esRef = useRef<EventSource | null>(null);
   const completedRef = useRef(false);
 
@@ -45,9 +47,8 @@ export function GeneratingStep({ jobId, error, onComplete, onError }: Props) {
   // Returns true once the job reached a terminal state (done or error).
   const fetchResult = useCallback(async (jId: string): Promise<boolean> => {
     if (completedRef.current) return true;
-    const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
     try {
-      const res = await fetch(`${API}/api/generate/result/${jId}`);
+      const res = await fetch(`${API_URL}/api/generate/result/${jId}`);
       if (!res.ok) return false;
       const data = await res.json();
       if (data.status === "done" && data.result && !completedRef.current) {
@@ -106,8 +107,7 @@ export function GeneratingStep({ jobId, error, onComplete, onError }: Props) {
     }
 
     completedRef.current = false;
-    const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-    const es = new EventSource(`${API}/api/generate/stream/${jobId}`);
+    const es = new EventSource(`${API_URL}/api/generate/stream/${jobId}`);
     esRef.current = es;
 
     es.onmessage = (ev) => {
@@ -131,7 +131,10 @@ export function GeneratingStep({ jobId, error, onComplete, onError }: Props) {
           // may still be running or may have already succeeded.
           es.close();
           void pollUntilDone(jobId, data.error || "Pipeline error");
+        } else if (data.step === "queued") {
+          setQueued(true);
         } else if (data.status === "running") {
+          setQueued(false);
           setActiveStep(data.step);
         } else if (data.status === "done") {
           setDoneSteps(prev => {
@@ -171,7 +174,7 @@ export function GeneratingStep({ jobId, error, onComplete, onError }: Props) {
         <p className="text-sm text-red-400 max-w-md mx-auto">{displayError}</p>
         <p className="text-xs text-slate-500">
           Your input is still filled in — go back and retry without re-entering anything.
-          If this repeats, check that ANTHROPIC_API_KEY is set in backend/.env.
+          If this keeps happening, wait a minute and try again.
         </p>
       </div>
     );
@@ -192,6 +195,8 @@ export function GeneratingStep({ jobId, error, onComplete, onError }: Props) {
           <p className="text-xs text-slate-600 mt-1">
             {recovering
               ? "Progress stream dropped — still generating, checking for your result…"
+              : queued
+              ? "Server is busy — your resume is queued and will start shortly"
               : "Live pipeline stream active"}
           </p>
         )}

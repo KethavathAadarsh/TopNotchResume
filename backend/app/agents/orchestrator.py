@@ -5,6 +5,8 @@ Remaining agents (Relevance → Optimizer → Composer) execute sequentially.
 """
 import asyncio
 import logging
+import time
+from collections.abc import Callable
 from langgraph.graph import StateGraph, END
 from app.agents.state import AgentState
 from app.agents.profile_agent import run_profile_agent
@@ -51,12 +53,31 @@ def _build_jarvis():
 jarvis = _build_jarvis()
 
 
-async def run_jarvis(request: GenerateRequest, job_id: str | None = None) -> AgentState:
-    """Execute the full JARVIS pipeline. If job_id is given, emits progress events for SSE."""
+# Graph node → the step key the frontend progress list uses, and the step that
+# starts once it finishes.
+_NODE_STEPS = {
+    "parallel_init":     ("parallel_init", "relevance"),
+    "compute_relevance": ("relevance", "optimize"),
+    "optimize_content":  ("optimize", "compose"),
+    "compose_resume":    ("compose", "render"),
+}
 
-    def _emit(step: str, status: str, **extra):
-        if job_id and job_id in _active_jobs:
-            _active_jobs[job_id]["events"].append({"step": step, "status": status, **extra})
+
+async def run_jarvis(
+    request: GenerateRequest,
+    on_progress: Callable[[str, str], None] | None = None,
+) -> AgentState:
+    """
+    Execute the full JARVIS pipeline.
+
+    Streams node updates from LangGraph so `on_progress(step, status)` fires as
+    each agent actually finishes — previously every step was reported "done"
+    only after the whole pipeline returned, so the UI sat on step 1 for minutes.
+    """
+
+    def _emit(step: str, status: str):
+        if on_progress:
+            on_progress(step, status)
 
     initial_state: AgentState = {
         "request": request,
@@ -73,9 +94,19 @@ async def run_jarvis(request: GenerateRequest, job_id: str | None = None) -> Age
     }
 
     logger.info("JARVIS: starting pipeline for '%s'", request.profile.name)
-    _emit("pipeline", "started")
+    _emit("parallel_init", "running")
 
-    final_state = await jarvis.ainvoke(initial_state)
+    # Nodes return partial updates with no reducers, so replaying them in
+    # order over the initial state reproduces what ainvoke() would return.
+    final_state: dict = dict(initial_state)
+    async for chunk in jarvis.astream(initial_state, stream_mode="updates"):
+        for node, update in chunk.items():
+            if update:
+                final_state.update(update)
+            done_step, next_step = _NODE_STEPS.get(node, (node, None))
+            _emit(done_step, "done")
+            if next_step:
+                _emit(next_step, "running")
 
     if final_state.get("errors"):
         logger.warning("JARVIS completed with errors: %s", final_state["errors"])
@@ -86,7 +117,6 @@ async def run_jarvis(request: GenerateRequest, job_id: str | None = None) -> Age
             len(final_state.get("keywords_matched", [])),
         )
 
-    _emit("pipeline", "complete")
     return final_state
 
 
@@ -97,7 +127,26 @@ def get_job(job_id: str) -> dict | None:
 
 
 def create_job(job_id: str):
-    _active_jobs[job_id] = {"status": "pending", "events": [], "result": None, "error": None}
+    _active_jobs[job_id] = {
+        "status": "pending", "events": [], "result": None, "error": None,
+        "created_at": time.monotonic(),
+    }
+
+
+def prune_jobs(max_age_seconds: float) -> int:
+    """
+    Drop old jobs so the in-memory store doesn't grow forever. Finished jobs go
+    after max_age; a job still "running" at twice that is treated as stuck.
+    """
+    now = time.monotonic()
+    stale = [
+        job_id for job_id, job in _active_jobs.items()
+        if (age := now - job.get("created_at", now)) > max_age_seconds
+        and (job["status"] in ("done", "error") or age > 2 * max_age_seconds)
+    ]
+    for job_id in stale:
+        del _active_jobs[job_id]
+    return len(stale)
 
 
 def finish_job(job_id: str, result: dict | None = None, error: str | None = None):

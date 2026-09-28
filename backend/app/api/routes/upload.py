@@ -6,6 +6,7 @@ File type is resolved from the filename extension first (browsers are
 inconsistent about MIME types — .docx frequently arrives as
 application/octet-stream), with the declared content type as a fallback.
 """
+import asyncio
 import io
 import logging
 import os
@@ -16,6 +17,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_PDF_PAGES = 30                  # resumes are short; caps parse time on huge PDFs
+MAX_TEXT_CHARS = 60_000
 
 # extension -> internal kind
 EXT_MAP = {
@@ -73,22 +76,27 @@ async def upload_resume(file: UploadFile = File(...)):
     """
     kind = _resolve_kind(file.filename, file.content_type)
 
-    contents = await file.read()
+    if file.size is not None and file.size > MAX_FILE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File is too large ({file.size / 1_048_576:.1f} MB). Maximum is 10 MB.",
+        )
+    # Read at most one byte past the limit so an oversized body is never
+    # pulled fully into memory.
+    contents = await file.read(MAX_FILE_BYTES + 1)
 
     if not contents:
         raise HTTPException(status_code=400, detail="File is empty.")
 
     if len(contents) > MAX_FILE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File is too large ({len(contents) / 1_048_576:.1f} MB). Maximum is 10 MB.",
-        )
+        raise HTTPException(status_code=413, detail="File is too large. Maximum is 10 MB.")
 
     try:
+        # Parsing is CPU-bound — keep it off the event loop.
         if kind == "pdf":
-            text = _extract_pdf(contents)
+            text = await asyncio.to_thread(_extract_pdf, contents)
         elif kind == "docx":
-            text = _extract_docx(contents)
+            text = await asyncio.to_thread(_extract_docx, contents)
         else:
             text = contents.decode("utf-8", errors="ignore")
     except HTTPException:
@@ -97,7 +105,7 @@ async def upload_resume(file: UploadFile = File(...)):
         logger.error("File extraction failed for %s: %s", file.filename, e)
         raise HTTPException(status_code=422, detail=f"Could not read this file: {e}")
 
-    text = text.strip()
+    text = text.strip()[:MAX_TEXT_CHARS]
 
     if not text:
         detail = "No text found in this file."
@@ -119,7 +127,7 @@ def _extract_pdf(data: bytes) -> str:
         raise HTTPException(status_code=501, detail="PDF parsing requires PyMuPDF (pip install PyMuPDF)")
 
     with fitz.open(stream=data, filetype="pdf") as doc:
-        return "\n".join(page.get_text() for page in doc)
+        return "\n".join(page.get_text() for i, page in enumerate(doc) if i < MAX_PDF_PAGES)
 
 
 def _extract_docx(data: bytes) -> str:

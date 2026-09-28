@@ -13,7 +13,7 @@ Themes:
 """
 import io
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
@@ -142,6 +142,21 @@ _DEFAULT_THEME = _THEMES["ats"]
 
 def _get_theme(fmt: str) -> DocxTheme:
     return _THEMES.get(fmt, _DEFAULT_THEME)
+
+
+# (layout key, min, max) — the range a composer override may set.
+_LAYOUT_BOUNDS = (
+    ("margin_inches", 0.4, 1.25),
+    ("font_size_body", 9, 12),
+    ("font_size_name", 14, 24),
+)
+
+
+def _clamp(value, lo: float, hi: float):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    clamped = max(lo, min(hi, value))
+    return int(round(clamped)) if isinstance(lo, int) else float(clamped)
 
 
 # ── Low-level XML helpers ────────────────────────────────────────────────────
@@ -428,16 +443,17 @@ def render_resume(composition: dict, resume_format: str = "ats") -> bytes:
     Render a ResumeComposition dict to polished .docx bytes.
     `resume_format` selects the visual theme: ats | executive | swe | startup | minimal | research
     """
-    theme = _get_theme(resume_format)
-
-    # Layout overrides from composer agent (font sizes, margins)
-    layout = composition.get("layout", {})
-    if layout.get("margin_inches"):
-        theme.margin_inches = layout["margin_inches"]
-    if layout.get("font_size_body"):
-        theme.font_size_body = layout["font_size_body"]
-    if layout.get("font_size_name"):
-        theme.font_size_name = layout["font_size_name"]
+    # Layout overrides from the composer agent. Applied to a copy — the themes in
+    # _THEMES are shared module state, so mutating them would leak one resume's
+    # layout into every later render of that format. Values are clamped because
+    # they come from the LLM.
+    layout = composition.get("layout") or {}
+    overrides = {}
+    for key, lo, hi in _LAYOUT_BOUNDS:
+        value = _clamp(layout.get(key), lo, hi)
+        if value is not None:
+            overrides[key] = value
+    theme = replace(_get_theme(resume_format), **overrides)
 
     doc = _setup_document(theme)
     _render_header(doc, composition.get("personal", {}), theme)

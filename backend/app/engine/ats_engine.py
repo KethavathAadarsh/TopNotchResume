@@ -23,6 +23,13 @@ POWER_VERBS = {
     "delivered", "drove", "established", "grew", "improved", "increased",
     "reduced", "refactored", "created", "deployed", "automated", "integrated",
     "collaborated", "mentored", "partnered", "streamlined", "transformed",
+    "accelerated", "achieved", "analyzed", "authored", "championed", "coordinated",
+    "cut", "defined", "directed", "enabled", "enhanced", "executed", "expanded",
+    "generated", "headed", "identified", "influenced", "introduced", "maintained",
+    "migrated", "modernized", "negotiated", "orchestrated", "owned", "pioneered",
+    "produced", "prototyped", "rebuilt", "redesigned", "resolved", "saved",
+    "secured", "spearheaded", "standardized", "supervised", "trained", "unified",
+    "upgraded", "wrote",
 }
 
 
@@ -39,8 +46,8 @@ def compute_ats_score(composition: dict, jd_analysis: dict) -> dict[str, Any]:
             "warnings": list[str],
         }
     """
-    ats_keywords = [kw.lower() for kw in jd_analysis.get("ats_keywords", [])]
-    mandatory_skills = [s.lower() for s in jd_analysis.get("mandatory_skills", [])]
+    ats_keywords = _dedupe(kw for kw in jd_analysis.get("ats_keywords", []) if isinstance(kw, str))
+    mandatory_skills = _dedupe(s for s in jd_analysis.get("mandatory_skills", []) if isinstance(s, str))
 
     # Flatten all text from the composition
     resume_text = _extract_all_text(composition).lower()
@@ -49,13 +56,14 @@ def compute_ats_score(composition: dict, jd_analysis: dict) -> dict[str, Any]:
     matched = []
     missing = []
     for kw in ats_keywords:
-        normalized = kw.lower()
-        if normalized in resume_text or _fuzzy_match(normalized, resume_text):
+        if _contains_term(kw, resume_text) or _fuzzy_match(kw, resume_text):
             matched.append(kw)
         else:
             missing.append(kw)
 
-    mandatory_matched = sum(1 for s in mandatory_skills if s in resume_text)
+    mandatory_matched = sum(
+        1 for s in mandatory_skills if _contains_term(s, resume_text) or _fuzzy_match(s, resume_text)
+    )
     mandatory_total = len(mandatory_skills) or 1
 
     # Scoring components
@@ -66,7 +74,7 @@ def compute_ats_score(composition: dict, jd_analysis: dict) -> dict[str, Any]:
     warnings = []
     structure_score = 100
 
-    sections = [s.lower() for s in composition.get("section_order", [])]
+    sections = [s.lower() for s in _strings(composition.get("section_order"))]
     if "experience" not in sections:
         warnings.append("No EXPERIENCE section — ATS may penalize")
         structure_score -= 20
@@ -101,68 +109,105 @@ def compute_ats_score(composition: dict, jd_analysis: dict) -> dict[str, Any]:
     }
 
 
+def _dedupe(items) -> list[str]:
+    """Lowercase, strip, and drop blanks/duplicates while keeping order."""
+    seen: dict[str, None] = {}
+    for item in items:
+        key = item.strip().lower()
+        if key:
+            seen.setdefault(key, None)
+    return list(seen)
+
+
+def _strings(values) -> list[str]:
+    return [v for v in (values or []) if isinstance(v, str)]
+
+
 def _extract_all_text(composition: dict) -> str:
-    parts = []
+    parts: list[str] = []
 
     summary = composition.get("summary", "")
-    if summary:
+    if isinstance(summary, str):
         parts.append(summary)
 
-    for exp in composition.get("experience", []):
-        parts.append(exp.get("title", ""))
-        parts.append(exp.get("company", ""))
-        parts.extend(exp.get("bullets", []))
+    for exp in composition.get("experience") or []:
+        parts.extend(_strings([exp.get("title"), exp.get("company")]))
+        parts.extend(_strings(exp.get("bullets")))
 
-    for proj in composition.get("projects", []):
-        parts.append(proj.get("name", ""))
-        parts.extend(proj.get("bullets", []))
+    for proj in composition.get("projects") or []:
+        parts.extend(_strings([proj.get("name")]))
+        parts.extend(_strings(proj.get("technologies")))
+        parts.extend(_strings(proj.get("bullets")))
 
-    for skill_section in composition.get("skill_sections", []):
-        parts.extend(skill_section.get("items", []))
+    for skill_section in composition.get("skill_sections") or []:
+        parts.extend(_strings(skill_section.get("items")))
 
-    for edu in composition.get("education", []):
-        parts.append(edu.get("degree", ""))
-        parts.append(edu.get("institution", ""))
+    for edu in composition.get("education") or []:
+        parts.extend(_strings([edu.get("degree"), edu.get("field"), edu.get("institution")]))
 
-    for cert in composition.get("certifications", []):
-        parts.append(cert.get("name", ""))
+    for cert in composition.get("certifications") or []:
+        parts.extend(_strings([cert.get("name")]))
 
     return " ".join(parts)
 
 
+_TERM_CACHE: dict[str, re.Pattern] = {}
+
+
+def _contains_term(term: str, text: str) -> bool:
+    """
+    Whole-term match. Plain substring matching produced false positives such as
+    "go" in "google", "r" in anything, or "ai" in "maintain". The lookarounds
+    treat letters/digits as word characters but let terms that start or end
+    with symbols (c++, c#, .net, ci/cd) match correctly.
+    """
+    pattern = _TERM_CACHE.get(term)
+    if pattern is None:
+        pattern = re.compile(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])")
+        _TERM_CACHE[term] = pattern
+    return pattern.search(text) is not None
+
+
+_EXPANSIONS = {
+    "ml": "machine learning",
+    "ai": "artificial intelligence",
+    "k8s": "kubernetes",
+    "aws": "amazon web services",
+    "gcp": "google cloud platform",
+    "ci/cd": "continuous integration",
+    "api": "application programming interface",
+    "nlp": "natural language processing",
+    "llm": "large language model",
+    "js": "javascript",
+    "ts": "typescript",
+    "postgres": "postgresql",
+}
+
+
 def _fuzzy_match(keyword: str, text: str) -> bool:
-    """Handles common abbreviation/full-form pairs."""
-    expansions = {
-        "ml": "machine learning",
-        "ai": "artificial intelligence",
-        "k8s": "kubernetes",
-        "aws": "amazon web services",
-        "gcp": "google cloud platform",
-        "ci/cd": "continuous integration",
-        "api": "application programming interface",
-    }
-    expanded = expansions.get(keyword)
-    if expanded and expanded in text:
+    """Handles common abbreviation/full-form pairs, in both directions."""
+    expanded = _EXPANSIONS.get(keyword)
+    if expanded and _contains_term(expanded, text):
         return True
-    # Also check reverse
-    for abbr, full in expansions.items():
-        if keyword == full and abbr in text:
+    for abbr, full in _EXPANSIONS.items():
+        if keyword == full and _contains_term(abbr, text):
             return True
     return False
 
 
 def _count_weak_bullets(composition: dict) -> int:
     count = 0
-    all_bullets = []
-    for exp in composition.get("experience", []):
-        all_bullets.extend(exp.get("bullets", []))
-    for proj in composition.get("projects", []):
-        all_bullets.extend(proj.get("bullets", []))
+    all_bullets: list[str] = []
+    for exp in composition.get("experience") or []:
+        all_bullets.extend(_strings(exp.get("bullets")))
+    for proj in composition.get("projects") or []:
+        all_bullets.extend(_strings(proj.get("bullets")))
 
     for bullet in all_bullets:
-        if not bullet:
+        words = bullet.split()
+        if not words:  # whitespace-only bullet — previously an IndexError
             continue
-        first_word = bullet.strip().split()[0].lower().rstrip(".,;:")
+        first_word = words[0].lower().strip(".,;:()\"'")
         if first_word not in POWER_VERBS:
             count += 1
 

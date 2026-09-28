@@ -6,7 +6,8 @@ Used by the frontend wizard to pre-fill all 7 sections from a history entry.
 """
 import logging
 from fastapi import APIRouter, HTTPException
-from app.utils.pg_store import get_restore_data
+from app.services.generation import is_valid_id
+from app.utils.artifacts import load_restore_data
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -16,9 +17,11 @@ router = APIRouter()
 async def restore_profile(download_id: str):
     """
     Retrieve saved profile and generation parameters for a past resume.
-    Returns 404 if not found or PostgreSQL not configured.
+    Checks PostgreSQL when configured, then the local SQLite store.
     """
-    data = await get_restore_data(download_id)
+    if not is_valid_id(download_id):
+        raise HTTPException(status_code=400, detail="Invalid ID")
+    data = await load_restore_data(download_id)
     if data is None:
         raise HTTPException(
             status_code=404,

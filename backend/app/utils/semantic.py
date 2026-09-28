@@ -19,6 +19,7 @@ import asyncio
 import hashlib
 import logging
 import re
+from collections import OrderedDict
 from typing import Any
 
 import numpy as np
@@ -27,8 +28,11 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# In-process vector cache (md5(text) → vector)
-_cache: dict[str, Any] = {}
+# In-process LRU vector cache (md5(text) → vector). Bounded — every generation
+# adds entries, and an unbounded dict is a slow memory leak on a long-lived server.
+_CACHE_MAX = 4096
+_cache: "OrderedDict[str, Any]" = OrderedDict()
+_openai_client = None
 
 # Per-backend calibration: (floor, ceiling) cosine mapped onto 0-100, plus the
 # default skill-match threshold.
@@ -89,10 +93,12 @@ def _sparse_cosine(a: dict[str, float], b: dict[str, float]) -> float:
 # ── Embedding backend ────────────────────────────────────────────────────────
 
 async def _openai_embedding(text: str) -> list[float]:
-    from openai import AsyncOpenAI
-
-    client = AsyncOpenAI(api_key=settings.openai_api_key)
-    response = await client.embeddings.create(
+    global _openai_client
+    if _openai_client is None:
+        from openai import AsyncOpenAI
+        # One client for the process — reuses its connection pool.
+        _openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
+    response = await _openai_client.embeddings.create(
         model=settings.openai_embedding_model,
         input=text[:8000],
     )
@@ -121,6 +127,7 @@ async def _get_vector(text: str, mode: str = "doc") -> Any:
     backend = active_backend()
     key = f"{backend}:{mode}:{hashlib.md5(text.encode()).hexdigest()}"
     if key in _cache:
+        _cache.move_to_end(key)
         return _cache[key]
 
     trigram_weight = 1.0 if mode == "term" else 0.0
@@ -137,6 +144,8 @@ async def _get_vector(text: str, mode: str = "doc") -> Any:
             vec = _lexical_vector(text, trigram_weight)
 
     _cache[key] = vec
+    if len(_cache) > _CACHE_MAX:
+        _cache.popitem(last=False)
     return vec
 
 

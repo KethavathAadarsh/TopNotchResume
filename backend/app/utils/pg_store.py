@@ -234,6 +234,8 @@ async def _create_dv2_schema() -> None:
         "ALTER TABLE dv.sat_resume_generation ADD COLUMN IF NOT EXISTS generation_ms INTEGER",
         "ALTER TABLE dv.sat_resume_generation ADD COLUMN IF NOT EXISTS kw_matched INTEGER",
         "ALTER TABLE dv.pit_resume_snapshot   ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE dv.pit_resume_snapshot   ADD COLUMN IF NOT EXISTS client_id TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_pit_client ON dv.pit_resume_snapshot(client_id, snapshot_dts)",
     ]
     async with _pool.acquire() as conn:
         async with conn.transaction():
@@ -402,6 +404,7 @@ async def save_generation(
     jd_analysis: dict,
     generation_ms: int = 0,
     kw_matched: int = 0,
+    client_id: str | None = None,
 ) -> None:
     if not _available():
         return
@@ -486,12 +489,12 @@ async def save_generation(
                        (hub_resume_hk, snapshot_dts, hub_candidate_hk, hub_job_hk,
                         sat_personal_load_dts, sat_experience_load_dts, sat_skills_load_dts,
                         sat_projects_load_dts, sat_education_load_dts, sat_generation_load_dts,
-                        sat_job_load_dts, job_description, target_role, format, max_pages)
-                       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                        sat_job_load_dts, job_description, target_role, format, max_pages, client_id)
+                       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
                        ON CONFLICT DO NOTHING""",
                     resume_hk, now, candidate_hk, job_hk,
                     personal_dts, exp_dts, skills_dts, projects_dts, edu_dts, now, job_dts,
-                    job_description, target_role, format, max_pages,
+                    job_description, target_role, format, max_pages, client_id,
                 )
 
         logger.info("pg_store: saved generation download_id=%s candidate=%s", download_id, email)
@@ -529,9 +532,9 @@ async def get_composition(download_id: str) -> dict | None:
         return None
 
 
-async def get_history_pg(limit: int = 50) -> list[dict]:
-    """Return recent resume generations ordered by newest first."""
-    if not _available():
+async def get_history_pg(limit: int = 50, client_id: str | None = None) -> list[dict]:
+    """Return one browser's recent resume generations, newest first."""
+    if not _available() or not client_id:
         return []
     try:
         async with _pool.acquire() as conn:
@@ -564,10 +567,11 @@ async def get_history_pg(limit: int = 50) -> list[dict]:
                     ON sj.hub_job_hk = pit.hub_job_hk
                     AND sj.load_dts = pit.sat_job_load_dts
                 WHERE NOT COALESCE(pit.is_deleted, FALSE)
+                  AND pit.client_id = $2
                 ORDER BY pit.snapshot_dts DESC
                 LIMIT $1
                 """,
-                limit,
+                limit, client_id,
             )
             return [
                 {
@@ -590,16 +594,17 @@ async def get_history_pg(limit: int = 50) -> list[dict]:
         return []
 
 
-async def delete_history_pg(download_id: str) -> None:
+async def delete_history_pg(download_id: str, client_id: str | None = None) -> None:
     """Soft-delete a resume from history (sets is_deleted=TRUE on the PIT row)."""
-    if not _available():
+    if not _available() or not client_id:
         return
     resume_hk = _hk(download_id)
     try:
         async with _pool.acquire() as conn:
             await conn.execute(
-                "UPDATE dv.pit_resume_snapshot SET is_deleted = TRUE WHERE hub_resume_hk = $1",
-                resume_hk,
+                "UPDATE dv.pit_resume_snapshot SET is_deleted = TRUE "
+                "WHERE hub_resume_hk = $1 AND client_id = $2",
+                resume_hk, client_id,
             )
     except Exception as exc:
         logger.error("pg_store: delete_history_pg failed download_id=%s — %s", download_id, exc)

@@ -4,17 +4,15 @@ Iterative Quality Refinement Routes
 POST /api/quality-check  — run quality check only (no regeneration)
 POST /api/refine         — run quality check + kick off a refined pipeline job
 """
-import asyncio
 import logging
-import uuid
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 
 from app.agents.quality_agent import run_quality_check
-from app.utils.pg_store import get_restore_data, get_composition
-from app.agents.orchestrator import create_job
+from app.utils.artifacts import load_composition, load_restore_data
+from app.utils.guards import client_id, limit_ai, limit_pipeline
 from app.models.schema import (
     GenerateRequest, ResumeFormat, CandidateProfile,
     ExperienceEntry, ProjectEntry, SkillCategory,
@@ -60,17 +58,17 @@ def _build_profile(data: dict) -> CandidateProfile:
     )
 
 
-@router.post("/quality-check")
+@router.post("/quality-check", dependencies=[Depends(limit_ai)])
 async def check_quality(req: QualityCheckRequest):
     """Quality check only — returns report with score, issues, recommendations."""
-    restore = await get_restore_data(req.download_id)
+    restore = await load_restore_data(req.download_id)
     if not restore:
         raise HTTPException(
             status_code=404,
-            detail="Resume not found in persistence store. Only resumes generated after DV2 was enabled support quality check.",
+            detail="Resume not found — it may have been generated before persistence was enabled, or the server was redeployed.",
         )
 
-    composition = await get_composition(req.download_id)
+    composition = await load_composition(req.download_id)
     if not composition:
         raise HTTPException(
             status_code=404,
@@ -86,20 +84,20 @@ async def check_quality(req: QualityCheckRequest):
     return report
 
 
-@router.post("/refine")
-async def refine_resume(req: RefineRequest):
+@router.post("/refine", dependencies=[Depends(limit_pipeline)])
+async def refine_resume(req: RefineRequest, owner: str | None = Depends(client_id)):
     """
     Quality check + start an iterative refinement pipeline.
     Returns {quality_report, job_id} — use job_id for SSE stream.
     """
-    restore = await get_restore_data(req.download_id)
+    restore = await load_restore_data(req.download_id)
     if not restore:
         raise HTTPException(
             status_code=404,
-            detail="Resume not found in persistence store. Only resumes generated after DV2 was enabled support refinement.",
+            detail="Resume not found — it may have been generated before persistence was enabled, or the server was redeployed.",
         )
 
-    composition = await get_composition(req.download_id)
+    composition = await load_composition(req.download_id)
 
     # Run quality check (non-fatal if composition missing — old generation)
     quality_report = None
@@ -155,11 +153,9 @@ async def refine_resume(req: RefineRequest):
     )
 
     # Import here to avoid circular import
-    from app.api.routes.stream import _run_pipeline
+    from app.api.routes.stream import start_pipeline_job
 
-    job_id = str(uuid.uuid4())
-    create_job(job_id)
-    asyncio.create_task(_run_pipeline(job_id, gen_request))
+    job_id = start_pipeline_job(gen_request, owner)
 
     return {
         "quality_report": quality_report,

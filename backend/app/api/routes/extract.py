@@ -5,10 +5,11 @@ returns structured JSON ready to populate the form.
 Supports section="all" to parse an entire resume at once.
 """
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Literal
 from app.utils.claude_client import call_claude_structured
+from app.utils.guards import limit_ai
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -273,7 +274,7 @@ class ExtractRequest(BaseModel):
     raw_text: str
 
 
-@router.post("/extract")
+@router.post("/extract", dependencies=[Depends(limit_ai)])
 async def extract_section(request: ExtractRequest):
     """
     Parse raw freeform text and return structured data for the given section.

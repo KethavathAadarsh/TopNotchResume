@@ -24,7 +24,17 @@ class Settings(BaseSettings):
     app_name: str = "TopNotchResume"
     debug: bool = False
     downloads_dir: str = "downloads"
-    download_ttl_seconds: int = 3600  # 1 hour
+    download_ttl_seconds: int = 86400  # 24 hours — files are swept after this
+    history_db_path: str = "data/history.db"
+
+    # Abuse protection — the API is public and every AI call spends credits.
+    # Per client IP, per hour. 0 disables a limit.
+    rate_limit_generations_per_hour: int = 10
+    rate_limit_ai_calls_per_hour: int = 60
+    max_concurrent_generations: int = 3
+    # In-memory job/session retention
+    job_ttl_seconds: int = 7200
+    session_ttl_seconds: int = 86400
 
     # CORS
     allowed_origins: list[str] = [
