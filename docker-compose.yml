@@ -1,0 +1,60 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: topnotchresume
+      POSTGRES_USER: jarvis
+      POSTGRES_PASSWORD: jarvis_secret
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jarvis -d topnotchresume"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    ports:
+      - "8010:8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-opus-5}
+      - ANTHROPIC_EFFORT=${ANTHROPIC_EFFORT:-}
+      # Optional — semantic embedding layer only (Anthropic has no embeddings API)
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - DEBUG=${DEBUG:-false}
+      - ALLOWED_ORIGINS=["http://localhost:3010"]
+      - DATABASE_URL=postgresql://jarvis:jarvis_secret@postgres:5432/topnotchresume
+    volumes:
+      - ./backend/downloads:/app/downloads
+      - sqlite_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        - NEXT_PUBLIC_API_URL=http://localhost:8010
+    ports:
+      - "3010:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  sqlite_data:

@@ -1,0 +1,23 @@
+# Render Blueprint for the FastAPI backend (Render dashboard → New → Blueprint).
+# Deploys are triggered by .github/workflows/backend-deploy.yml, not on every push.
+services:
+  - type: web
+    name: topnotchresume-api
+    runtime: docker
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    plan: free
+    autoDeploy: false
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: DEBUG
+        value: "false"
+      # JSON list, e.g. ["https://<github-user>.github.io"]
+      - key: ALLOWED_ORIGINS
+        sync: false
