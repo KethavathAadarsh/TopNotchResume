@@ -29,6 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Housekeeping runs every 10 minutes; see _housekeeping() for what it prunes.
 _SWEEP_INTERVAL_SECONDS = 600
 
 
